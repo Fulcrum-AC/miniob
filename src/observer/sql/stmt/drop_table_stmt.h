@@ -10,22 +10,27 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
+#include "sql/stmt/stmt.h"
+
+class Db;
+
 /**
- * @brief Attribute type definitions.
+ * @brief drop table statement
+ * @ingroup Statement
  */
-enum class AttrType
+class DropTableStmt : public Stmt
 {
-  UNDEFINED,
-  CHARS,
-  INTS,
-  FLOATS,
-  DATES,
-  VECTORS,
-  BOOLEANS,
-  MAXTYPE,
+public:
+  explicit DropTableStmt(const string &table_name) : table_name_(table_name) {}
+  virtual ~DropTableStmt() = default;
+
+  StmtType type() const override { return StmtType::DROP_TABLE; }
+
+  const string &table_name() const { return table_name_; }
+
+  static RC create(Db *db, const DropTableSqlNode &drop_table, Stmt *&stmt);
+
+private:
+  string table_name_;
 };
 
-const char *attr_type_to_string(AttrType type);
-AttrType    attr_type_from_string(const char *s);
-bool        is_numerical_type(AttrType type);
-bool        is_string_type(AttrType type);

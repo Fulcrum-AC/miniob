@@ -10,22 +10,19 @@ See the Mulan PSL v2 for more details. */
 
 #pragma once
 
-/**
- * @brief Attribute type definitions.
- */
-enum class AttrType
-{
-  UNDEFINED,
-  CHARS,
-  INTS,
-  FLOATS,
-  DATES,
-  VECTORS,
-  BOOLEANS,
-  MAXTYPE,
-};
+#include "common/sys/rc.h"
 
-const char *attr_type_to_string(AttrType type);
-AttrType    attr_type_from_string(const char *s);
-bool        is_numerical_type(AttrType type);
-bool        is_string_type(AttrType type);
+class SQLStageEvent;
+
+/**
+ * @brief 删除表执行器
+ * @ingroup Executor
+ */
+class DropTableExecutor
+{
+public:
+  DropTableExecutor()          = default;
+  virtual ~DropTableExecutor() = default;
+
+  RC execute(SQLStageEvent *sql_event);
+};

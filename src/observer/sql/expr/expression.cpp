@@ -240,6 +240,8 @@ RC ComparisonExpr::eval(Chunk &chunk, vector<uint8_t> &select)
   }
   if (left_column.attr_type() == AttrType::INTS) {
     rc = compare_column<int>(left_column, right_column, select);
+  } else if (left_column.attr_type() == AttrType::DATES) {
+    rc = compare_column<int>(left_column, right_column, select);
   } else if (left_column.attr_type() == AttrType::FLOATS) {
     rc = compare_column<float>(left_column, right_column, select);
   } else if (left_column.attr_type() == AttrType::CHARS) {
