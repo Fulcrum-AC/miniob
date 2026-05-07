@@ -15,6 +15,7 @@ See the Mulan PSL v2 for more details. */
 #include "storage/common/meta_util.h"
 #include "storage/db/db.h"
 
+#include <cstring>
 
 HeapTableEngine::~HeapTableEngine()
 {
@@ -61,7 +62,7 @@ RC HeapTableEngine::insert_record(Record &record)
   return rc;
 }
 
-RC HeapTableEngine::insert_chunk(const Chunk& chunk)
+RC HeapTableEngine::insert_chunk(const Chunk &chunk)
 {
   RC rc = RC::SUCCESS;
   rc    = record_handler_->insert_chunk(chunk, table_meta_->record_size());
@@ -75,9 +76,7 @@ RC HeapTableEngine::insert_chunk(const Chunk& chunk)
 }
 
 RC HeapTableEngine::visit_record(const RID &rid, function<bool(Record &)> visitor)
-{
-  return record_handler_->visit_record(rid, visitor);
-}
+{ return record_handler_->visit_record(rid, visitor); }
 
 RC HeapTableEngine::get_record(const RID &rid, Record &record)
 {
@@ -103,10 +102,136 @@ RC HeapTableEngine::delete_record(const Record &record)
   return rc;
 }
 
+RC HeapTableEngine::update_record_with_trx(const Record &old_record, const Record &new_record, Trx *trx)
+{
+  if (trx == nullptr) {
+    LOG_WARN("update record with null trx. table=%s", table_meta_->name());
+    return RC::INVALID_ARGUMENT;
+  }
+
+  if (old_record.len() != new_record.len()) {
+    LOG_WARN("record size mismatch when updating. table=%s, old_len=%d, new_len=%d", table_meta_->name(), old_record.len(), new_record.len());
+    return RC::INVALID_ARGUMENT;
+  }
+
+  Record current_record;
+  RC     rc = record_handler_->get_record(old_record.rid(), current_record);
+  if (rc != RC::SUCCESS) {
+    LOG_WARN("failed to get current record for update. table=%s, rid=%s, rc=%s", table_meta_->name(), old_record.rid().to_string().c_str(), strrc(rc));
+    return rc;
+  }
+
+  rc = trx->visit_record(table_, current_record, ReadWriteMode::READ_WRITE);
+  if (rc != RC::SUCCESS) {
+    LOG_WARN("failed to check record visibility before update. table=%s, rid=%s, rc=%s", table_meta_->name(), old_record.rid().to_string().c_str(), strrc(rc));
+    return rc;
+  }
+
+  if (0 == memcmp(current_record.data(), new_record.data(), static_cast<size_t>(new_record.len()))) {
+    return RC::SUCCESS;
+  }
+
+  RC storage_copy_rc = RC::SUCCESS;
+  rc                 = record_handler_->visit_record(old_record.rid(), [&](Record &record) -> bool {
+    storage_copy_rc = record.copy_data(new_record.data(), new_record.len());
+    if (storage_copy_rc == RC::SUCCESS) {
+      record.set_rid(old_record.rid());
+    }
+    return storage_copy_rc == RC::SUCCESS;
+  });
+  if (storage_copy_rc != RC::SUCCESS) {
+    LOG_WARN("failed to copy updated record data. table=%s, rid=%s, rc=%s", table_meta_->name(), old_record.rid().to_string().c_str(), strrc(storage_copy_rc));
+    return storage_copy_rc;
+  }
+  if (rc != RC::SUCCESS) {
+    LOG_WARN("failed to write updated record. table=%s, rid=%s, rc=%s", table_meta_->name(), old_record.rid().to_string().c_str(), strrc(rc));
+    return rc;
+  }
+
+  auto restore_storage = [&]() -> RC {
+    RC restore_copy_rc = RC::SUCCESS;
+    RC restore_rc      = record_handler_->visit_record(old_record.rid(), [&](Record &record) -> bool {
+      restore_copy_rc = record.copy_data(current_record.data(), current_record.len());
+      if (restore_copy_rc == RC::SUCCESS) {
+        record.set_rid(old_record.rid());
+      }
+      return restore_copy_rc == RC::SUCCESS;
+    });
+    if (restore_copy_rc != RC::SUCCESS) {
+      return restore_copy_rc;
+    }
+    return restore_rc;
+  };
+
+  auto rollback_index_update = [&](Index *index) -> RC {
+    RC rollback_rc = index->delete_entry(new_record.data(), &new_record.rid());
+    if (rollback_rc != RC::SUCCESS && rollback_rc != RC::RECORD_NOT_EXIST) {
+      LOG_WARN("failed to rollback updated index entry deletion. table=%s, index=%s, rid=%s, rc=%s",
+               table_meta_->name(), index->index_meta().name(), new_record.rid().to_string().c_str(), strrc(rollback_rc));
+    }
+
+    RC restore_index_rc = index->insert_entry(current_record.data(), &current_record.rid());
+    if (restore_index_rc != RC::SUCCESS) {
+      LOG_PANIC("failed to restore old index entry after update failure. table=%s, index=%s, rid=%s, rc=%s",
+                table_meta_->name(), index->index_meta().name(), current_record.rid().to_string().c_str(), strrc(restore_index_rc));
+      return restore_index_rc;
+    }
+    return RC::SUCCESS;
+  };
+
+  vector<Index *> updated_indexes;
+  for (Index *index : indexes_) {
+    const FieldMeta *index_field = table_meta_->field(index->index_meta().field());
+    if (index_field == nullptr) {
+      LOG_WARN("invalid index field. table=%s, index=%s", table_meta_->name(), index->index_meta().name());
+      rc = RC::INTERNAL;
+      break;
+    }
+
+    const char *old_field_data = current_record.data() + index_field->offset();
+    const char *new_field_data = new_record.data() + index_field->offset();
+    if (memcmp(old_field_data, new_field_data, static_cast<size_t>(index_field->len())) == 0) {
+      continue;
+    }
+
+    rc = index->delete_entry(current_record.data(), &current_record.rid());
+    if (rc != RC::SUCCESS) {
+      LOG_WARN("failed to delete old index entry while updating record. table=%s, index=%s, rid=%s, rc=%s",
+               table_meta_->name(), index->index_meta().name(), current_record.rid().to_string().c_str(), strrc(rc));
+      break;
+    }
+
+    rc = index->insert_entry(new_record.data(), &new_record.rid());
+    if (rc != RC::SUCCESS) {
+      LOG_WARN("failed to insert new index entry while updating record. table=%s, index=%s, rid=%s, rc=%s",
+               table_meta_->name(), index->index_meta().name(), new_record.rid().to_string().c_str(), strrc(rc));
+      (void)rollback_index_update(index);
+      break;
+    }
+
+    updated_indexes.push_back(index);
+  }
+
+  if (rc != RC::SUCCESS) {
+    for (auto iter = updated_indexes.rbegin(); iter != updated_indexes.rend(); ++iter) {
+      (void)rollback_index_update(*iter);
+    }
+
+    RC restore_storage_rc = restore_storage();
+    if (restore_storage_rc != RC::SUCCESS) {
+      LOG_PANIC("failed to restore storage after update failure. table=%s, rid=%s, rc=%s",
+                table_meta_->name(), old_record.rid().to_string().c_str(), strrc(restore_storage_rc));
+      return restore_storage_rc;
+    }
+  }
+
+  return rc;
+}
+
 RC HeapTableEngine::get_record_scanner(RecordScanner *&scanner, Trx *trx, ReadWriteMode mode)
 {
   scanner = new HeapRecordScanner(table_, *data_buffer_pool_, trx, db_->log_handler(), mode, nullptr);
-  RC rc = scanner->open_scan();
+  RC rc   = scanner->open_scan();
   if (rc != RC::SUCCESS) {
     LOG_ERROR("failed to open scanner. rc=%s", strrc(rc));
   }
@@ -151,7 +276,7 @@ RC HeapTableEngine::create_index(Trx *trx, const FieldMeta *field_meta, const ch
 
   // 遍历当前的所有数据，插入这个索引
   RecordScanner *scanner = nullptr;
-  rc = get_record_scanner(scanner, trx, ReadWriteMode::READ_ONLY);
+  rc                     = get_record_scanner(scanner, trx, ReadWriteMode::READ_ONLY);
   if (rc != RC::SUCCESS) {
     LOG_WARN("failed to create scanner while creating index. table=%s, index=%s, rc=%s", 
              table_meta_->name(), index_name, strrc(rc));
